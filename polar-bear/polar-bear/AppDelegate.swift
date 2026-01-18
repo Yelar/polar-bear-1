@@ -80,8 +80,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             do {
                 let compressed = try await client.compressText(text)
-                if !accessibilityService.writeText(compressed, to: focusedElement) {
-                    accessibilityService.pasteTextViaKeyboard(compressed)
+                let sanitized = compressed.trimmingTrailingNewlines()
+                let wrote = accessibilityService.writeText(sanitized, to: focusedElement)
+                if !wrote {
+                    accessibilityService.pasteTextViaKeyboard(sanitized)
+                }
+                if !accessibilityService.moveCaretToEnd(in: focusedElement, fallbackLength: sanitized.count) {
+                    accessibilityService.moveCaretToEndViaKeyboard()
                 }
             } catch {
                 NSSound.beep()
@@ -118,5 +123,15 @@ enum SettingsStore {
             backendUrlKey: "http://127.0.0.1:8000/compress",
             aggressivenessKey: 0.5,
         ])
+    }
+}
+
+private extension String {
+    func trimmingTrailingNewlines() -> String {
+        var result = self
+        while let last = result.last, last == "\n" || last == "\r" {
+            result.removeLast()
+        }
+        return result
     }
 }

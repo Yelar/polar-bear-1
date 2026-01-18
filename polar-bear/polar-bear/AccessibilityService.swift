@@ -26,10 +26,13 @@ final class AccessibilityService {
         let systemWide = AXUIElementCreateSystemWide()
         var focused: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focused)
-        guard error == .success, let element = focused as? AXUIElement else {
+        guard error == .success, let element = focused else {
             return nil
         }
-        return element
+        guard CFGetTypeID(element) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(element, to: AXUIElement.self)
     }
 
     func readText(from element: AXUIElement) -> String? {
@@ -38,19 +41,23 @@ final class AccessibilityService {
             return nil
         }
 
-        var value: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
-        guard error == .success else {
-            NSSound.beep()
-            return nil
+        if let value = copyStringValue(from: element, attribute: kAXValueAttribute as CFString) {
+            return value
         }
 
-        if let stringValue = value as? String {
-            return stringValue
+        if let selected = copyStringValue(from: element, attribute: kAXSelectedTextAttribute as CFString),
+           !selected.isEmpty {
+            return selected
         }
 
-        if let attributedValue = value as? NSAttributedString {
-            return attributedValue.string
+        if selectAllText(in: element),
+           let selected = copyStringValue(from: element, attribute: kAXSelectedTextAttribute as CFString),
+           !selected.isEmpty {
+            return selected
+        }
+
+        if let clipboardText = copyTextViaKeyboard() {
+            return clipboardText
         }
 
         NSSound.beep()
@@ -58,8 +65,16 @@ final class AccessibilityService {
     }
 
     func writeText(_ text: String, to element: AXUIElement) -> Bool {
-        let error = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFTypeRef)
-        return error == .success
+        if AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
+            return true
+        }
+
+        if selectAllText(in: element),
+           AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+            return true
+        }
+
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
     }
 
     func pasteTextViaKeyboard(_ text: String) {
@@ -71,12 +86,20 @@ final class AccessibilityService {
         sendKeyCombo(keyCode: 0, flags: .maskCommand) // Command + A
         sendKeyCombo(keyCode: 9, flags: .maskCommand) // Command + V
 
-        if let previousItems {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                pasteboard.clearContents()
-                pasteboard.writeObjects(previousItems)
-            }
-        }
+        restorePasteboardItems(previousItems)
+    }
+
+    func moveCaretToEnd(in element: AXUIElement, fallbackLength: Int) -> Bool {
+        let length = numberOfCharacters(in: element) ?? fallbackLength
+        guard length >= 0 else { return false }
+        var range = CFRange(location: length, length: 0)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue) == .success
+    }
+
+    func moveCaretToEndViaKeyboard() {
+        sendKeyCombo(keyCode: 125, flags: .maskCommand) // Command + Down
+        sendKeyCombo(keyCode: 124, flags: .maskCommand) // Command + Right
     }
 
     private func isSecureTextField(_ element: AXUIElement) -> Bool {
@@ -93,6 +116,75 @@ final class AccessibilityService {
         let error = AXUIElementCopyAttributeValue(element, attribute, &value)
         guard error == .success else { return nil }
         return value as? String
+    }
+
+    private func copyStringValue(from element: AXUIElement, attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard error == .success, let value else { return nil }
+        if let stringValue = value as? String {
+            return stringValue
+        }
+        if let attributedValue = value as? NSAttributedString {
+            return attributedValue.string
+        }
+        return nil
+    }
+
+    private func selectAllText(in element: AXUIElement) -> Bool {
+        guard let count = numberOfCharacters(in: element) else { return false }
+        guard count > 0 else { return false }
+        var range = CFRange(location: 0, length: count)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue) == .success
+    }
+
+    private func numberOfCharacters(in element: AXUIElement) -> Int? {
+        var countValue: CFTypeRef?
+        let countError = AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &countValue)
+        guard countError == .success else { return nil }
+
+        if let number = countValue as? NSNumber {
+            return number.intValue
+        }
+        if let intValue = countValue as? Int {
+            return intValue
+        }
+        return nil
+    }
+
+    private func copyTextViaKeyboard() -> String? {
+        let pasteboard = NSPasteboard.general
+        let previousItems = pasteboard.pasteboardItems
+        let previousChangeCount = pasteboard.changeCount
+
+        sendKeyCombo(keyCode: 0, flags: .maskCommand) // Command + A
+        sendKeyCombo(keyCode: 8, flags: .maskCommand) // Command + C
+
+        let didChange = waitForPasteboardChange(from: previousChangeCount)
+        let text = didChange ? pasteboard.string(forType: .string) : nil
+        restorePasteboardItems(previousItems)
+        return text
+    }
+
+    private func waitForPasteboardChange(from changeCount: Int) -> Bool {
+        let deadline = Date().addingTimeInterval(0.3)
+        while Date() < deadline {
+            if NSPasteboard.general.changeCount != changeCount {
+                return true
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        return false
+    }
+
+    private func restorePasteboardItems(_ items: [NSPasteboardItem]?) {
+        guard let items else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects(items)
+        }
     }
 
     private func sendKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {

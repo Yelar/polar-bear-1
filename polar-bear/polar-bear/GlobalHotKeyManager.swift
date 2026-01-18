@@ -11,12 +11,11 @@ final class GlobalHotKeyManager {
     var onTrigger: (() -> Void)?
 
     private var monitor: Any?
-    private var isTriggered = false
 
     func start() {
         stop()
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            self?.handleFlagsChanged(event)
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleKeyDown(event)
         }
     }
 
@@ -25,22 +24,17 @@ final class GlobalHotKeyManager {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
         }
-        isTriggered = false
     }
 
-    private func handleFlagsChanged(_ event: NSEvent) {
+    private func handleKeyDown(_ event: NSEvent) {
+        if event.isARepeat { return }
         let requiredFlags: NSEvent.ModifierFlags = [.command, .option]
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(requiredFlags) else { return }
+        guard event.charactersIgnoringModifiers?.lowercased() == "c" else { return }
 
-        if flags.contains(requiredFlags) {
-            if !isTriggered {
-                isTriggered = true
-                DispatchQueue.main.async { [weak self] in
-                    self?.onTrigger?()
-                }
-            }
-        } else {
-            isTriggered = false
+        DispatchQueue.main.async { [weak self] in
+            self?.onTrigger?()
         }
     }
 

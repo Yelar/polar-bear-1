@@ -29,7 +29,7 @@ struct SettingsView: View {
             }
 
             Section("Hot Key") {
-                Text("Press Command + Option to compress the focused text field.")
+                Text("Press Command + Option + C to compress the focused text field.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
