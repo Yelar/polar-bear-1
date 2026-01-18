@@ -2,30 +2,61 @@
 """
 LongBench v2 Evaluation Module
 
-A mini version of The Token Company LongBench v2 experiment for OpenRouter.
-Supports multiple compression conditions with budget-guarded execution.
+A comprehensive evaluation framework for prompt compression on LongBench v2.
+Supports multiple compression conditions with budget-guarded execution,
+deterministic sampling, and detailed statistical analysis.
 
 Usage:
-    python longbench_eval.py --model openai/gpt-4o-mini --n 30 --seed 42 --cutoffs 0.3 0.9 --budget-usd 10
+    python -m evals.longbench_eval --n 30 --cutoffs 0.3 0.9 --budget-usd 10
 
-Author: LLM Input Compressor Team
+    # Dry run (no API calls)
+    python -m evals.longbench_eval --n 10 --dry-run
+
+    # With retries for invalid responses
+    python -m evals.longbench_eval --n 30 --retry-invalid 2
 """
 
 import os
-import re
 import sys
-import json
 import time
 import random
-import hashlib
 import argparse
 import logging
 from pathlib import Path
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field, asdict
 from collections import defaultdict
+from dataclasses import asdict
 
 import requests
+
+# Local imports
+from .prompting import (
+    build_prompt_from_example,
+    parse_answer,
+    build_repair_prompt,
+    validate_compressed_prompt,
+    ensure_final_instruction,
+)
+from .stats import (
+    bootstrap_paired_diff,
+    mcnemar_test,
+    compute_accuracy_strict,
+    compute_accuracy_valid_only,
+    compute_invalid_rate,
+)
+from .io_utils import (
+    ResultCache,
+    CacheKey,
+    ArtifactWriter,
+    ExampleResult,
+    ConditionMetrics,
+    compute_prompt_hash,
+    save_results_json,
+    save_results_csv,
+    save_examples_csv,
+    print_results_table,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -35,174 +66,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Try to load dotenv
+# Load .env if available
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    logger.warning("python-dotenv not installed. Set OPENROUTER_API_KEY in environment.")
+    pass
 
-# Try to import tiktoken for accurate token counting
+# Try tiktoken
 TIKTOKEN_AVAILABLE = False
+_encoder = None
 try:
     import tiktoken
     TIKTOKEN_AVAILABLE = True
+    try:
+        _encoder = tiktoken.get_encoding("o200k_base")
+    except Exception:
+        _encoder = tiktoken.get_encoding("cl100k_base")
 except ImportError:
     logger.warning("tiktoken not available, using heuristic token counting")
-
-# Try to import numpy for bootstrap
-NUMPY_AVAILABLE = False
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    logger.warning("numpy not available, using stdlib for statistics")
-
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-@dataclass
-class EvalConfig:
-    """Configuration for evaluation run."""
-    model: str = "openai/gpt-4o-mini"
-    n: int = 30
-    seed: int = 42
-    cutoffs: List[float] = field(default_factory=lambda: [0.3, 0.9])
-    budget_usd: float = 10.0
-    max_context_tokens_for_sampling: int = 60_000
-    max_output_tokens: int = 8
-    temperature: float = 0.0
-    price_input_per_million: float = 0.15
-    price_output_per_million: float = 0.60
-    cache_dir: str = "runs/cache"
-    results_dir: str = "runs"
-    no_api: bool = False
-    openrouter_api_key: Optional[str] = None
-
-    def __post_init__(self):
-        if self.openrouter_api_key is None:
-            self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-
-
-# =============================================================================
-# Token Counting
-# =============================================================================
-
-class TokenCounter:
-    """Token counter with tiktoken or fallback."""
-
-    def __init__(self, encoding_name: str = "o200k_base"):
-        self.encoder = None
-        if TIKTOKEN_AVAILABLE:
-            try:
-                self.encoder = tiktoken.get_encoding(encoding_name)
-            except Exception:
-                try:
-                    self.encoder = tiktoken.get_encoding("cl100k_base")
-                except Exception:
-                    pass
-
-    def count(self, text: str) -> int:
-        if not text:
-            return 0
-        if self.encoder:
-            try:
-                return len(self.encoder.encode(text))
-            except ValueError as e:
-                if "disallowed special token" in str(e):
-                    # Handle special token error by using fallback
-                    words = text.split()
-                    punct = len(re.findall(r'[.,!?;:"\'()\[\]{}]', text))
-                    return int((len(words) + punct) * 1.3)
-                else:
-                    raise
-        # Fallback heuristic
-        words = text.split()
-        punct = len(re.findall(r'[.,!?;:"\'()\[\]{}]', text))
-        return int((len(words) + punct) * 1.3)
-
-
-_token_counter = TokenCounter()
 
 
 def count_tokens(text: str) -> int:
     """Count tokens in text."""
-    return _token_counter.count(text)
+    if not text:
+        return 0
+    if TIKTOKEN_AVAILABLE and _encoder:
+        try:
+            return len(_encoder.encode(text))
+        except ValueError:
+            pass
+    # Fallback heuristic
+    words = len(text.split())
+    return int(words * 1.3)
 
 
 # =============================================================================
-# Caching
-# =============================================================================
-
-class ResultCache:
-    """Filesystem cache for API results."""
-
-    def __init__(self, cache_dir: str):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _make_key(
-        self,
-        model: str,
-        condition: str,
-        cutoff: float,
-        example_id: str,
-        temperature: float,
-        prompt_hash: str
-    ) -> str:
-        """Create cache key."""
-        key_str = f"{model}|{condition}|{cutoff}|{example_id}|{temperature}|{prompt_hash}"
-        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
-
-    def get(
-        self,
-        model: str,
-        condition: str,
-        cutoff: float,
-        example_id: str,
-        temperature: float,
-        prompt_hash: str
-    ) -> Optional[Dict]:
-        """Get cached result if exists."""
-        key = self._make_key(model, condition, cutoff, example_id, temperature, prompt_hash)
-        cache_file = self.cache_dir / f"{key}.json"
-        if cache_file.exists():
-            try:
-                with open(cache_file) as f:
-                    return json.load(f)
-            except Exception:
-                return None
-        return None
-
-    def set(
-        self,
-        model: str,
-        condition: str,
-        cutoff: float,
-        example_id: str,
-        temperature: float,
-        prompt_hash: str,
-        result: Dict
-    ):
-        """Cache a result."""
-        key = self._make_key(model, condition, cutoff, example_id, temperature, prompt_hash)
-        cache_file = self.cache_dir / f"{key}.json"
-        with open(cache_file, 'w') as f:
-            json.dump(result, f)
-
-
-# =============================================================================
-# OpenRouter API Client
+# OpenRouter Client
 # =============================================================================
 
 class OpenRouterClient:
-    """Client for OpenRouter Chat Completions API."""
+    """Client for OpenRouter API with retry logic."""
 
     BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
     MAX_RETRIES = 3
-    RETRY_DELAYS = [1, 2, 4]  # Exponential backoff
+    RETRY_DELAYS = [1, 2, 4]
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -210,7 +118,7 @@ class OpenRouterClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/longbench-eval",
-            "X-Title": "LongBench v2 Evaluation"
+            "X-Title": "LongBench v2 Evaluation",
         }
 
     def chat_completion(
@@ -219,9 +127,9 @@ class OpenRouterClient:
         model: str,
         temperature: float = 0.0,
         max_tokens: int = 8,
-        timeout: int = 60
+        timeout: int = 60,
     ) -> Dict:
-        """Make a chat completion request."""
+        """Make chat completion request with retries."""
         payload = {
             "model": model,
             "messages": messages,
@@ -232,32 +140,26 @@ class OpenRouterClient:
         last_error = None
         for attempt, delay in enumerate(self.RETRY_DELAYS):
             try:
-                response = requests.post(
+                resp = requests.post(
                     self.BASE_URL,
                     headers=self.headers,
                     json=payload,
-                    timeout=timeout
+                    timeout=timeout,
                 )
 
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:
-                    # Rate limited
+                if resp.status_code == 200:
+                    return resp.json()
+                elif resp.status_code == 429:
                     logger.warning(f"Rate limited, waiting {delay}s...")
                     time.sleep(delay)
-                    continue
-                elif response.status_code >= 500:
-                    # Server error
-                    logger.warning(f"Server error {response.status_code}, retrying...")
+                elif resp.status_code >= 500:
+                    logger.warning(f"Server error {resp.status_code}, retrying...")
                     time.sleep(delay)
-                    continue
                 else:
-                    # Client error
-                    error_msg = response.text[:200]
-                    raise Exception(f"API error {response.status_code}: {error_msg}")
+                    raise Exception(f"API error {resp.status_code}: {resp.text[:200]}")
 
             except requests.exceptions.Timeout:
-                logger.warning(f"Request timeout, attempt {attempt + 1}/{self.MAX_RETRIES}")
+                logger.warning(f"Timeout, attempt {attempt + 1}/{self.MAX_RETRIES}")
                 last_error = "timeout"
                 time.sleep(delay)
             except requests.exceptions.RequestException as e:
@@ -269,51 +171,6 @@ class OpenRouterClient:
 
 
 # =============================================================================
-# Answer Parsing
-# =============================================================================
-
-def parse_answer(text: str) -> Optional[str]:
-    """
-    Parse model output to extract A/B/C/D answer.
-
-    Handles formats:
-    - "A", "B", "C", "D"
-    - "Answer: A", "The answer is B"
-    - "(A)", "[A]"
-    - "A." or "A:"
-
-    Returns None if no valid answer found.
-    """
-    if not text:
-        return None
-
-    text = text.strip().upper()
-
-    # Pattern: standalone letter A-D
-    patterns = [
-        r'^([ABCD])$',  # Just the letter
-        r'^([ABCD])[.:\)]',  # Letter followed by punctuation
-        r'^\(([ABCD])\)',  # (A)
-        r'^\[([ABCD])\]',  # [A]
-        r'^ANSWER[:\s]+([ABCD])',  # Answer: A
-        r'^THE ANSWER IS[:\s]+([ABCD])',  # The answer is A
-        r'^([ABCD])\s*$',  # Letter with trailing space
-    ]
-
-    for pattern in patterns:
-        match = re.match(pattern, text)
-        if match:
-            return match.group(1)
-
-    # Fallback: find first standalone A-D in text
-    match = re.search(r'\b([ABCD])\b', text)
-    if match:
-        return match.group(1)
-
-    return None
-
-
-# =============================================================================
 # Dataset Loading
 # =============================================================================
 
@@ -321,32 +178,27 @@ def load_longbench_dataset(
     max_context_tokens: int,
     n: int,
     seed: int,
-    streaming: bool = True
-) -> List[Dict]:
+) -> Tuple[List[Dict], int]:
     """
-    Load and sample from LongBench v2 dataset.
+    Load and sample from LongBench v2 with stratification.
 
-    Filters to rows with context <= max_context_tokens.
-    Stratifies by domain and length using round-robin.
+    Returns:
+        Tuple of (selected_examples, eligible_pool_size)
     """
     try:
         from datasets import load_dataset
     except ImportError:
-        raise ImportError("Please install datasets: pip install datasets")
+        raise ImportError("Install datasets: pip install datasets")
 
     logger.info("Loading LongBench v2 dataset...")
+    dataset = load_dataset("THUDM/LongBench-v2", split="train", streaming=True)
 
-    # Load dataset
-    if streaming:
-        dataset = load_dataset("zai-org/LongBench-v2", split="train", streaming=True)
-    else:
-        dataset = load_dataset("zai-org/LongBench-v2", split="train")
-
-    # Filter and collect examples
-    filtered = []
-    domain_length_buckets = defaultdict(list)
+    # Collect and filter
+    domain_length_buckets: Dict[str, List[Dict]] = defaultdict(list)
+    total_scanned = 0
 
     for example in dataset:
+        total_scanned += 1
         context = example.get('context', '')
         ctx_tokens = count_tokens(context)
 
@@ -357,28 +209,26 @@ def load_longbench_dataset(
             key = f"{domain}|{length}"
             domain_length_buckets[key].append(example)
 
-        # Early exit if we have enough
+        # Early exit after scanning enough
         if sum(len(v) for v in domain_length_buckets.values()) >= n * 10:
             break
 
-    if not domain_length_buckets:
+    eligible_pool_size = sum(len(v) for v in domain_length_buckets.values())
+    logger.info(f"Scanned {total_scanned} examples, {eligible_pool_size} eligible across {len(domain_length_buckets)} strata")
+
+    if eligible_pool_size == 0:
         raise ValueError("No examples found within token limit")
 
-    logger.info(f"Found {sum(len(v) for v in domain_length_buckets.values())} eligible examples across {len(domain_length_buckets)} strata")
-
-    # Stratified sampling via round-robin
+    # Stratified round-robin sampling
     random.seed(seed)
+    for bucket in domain_length_buckets.values():
+        random.shuffle(bucket)
 
-    # Shuffle within each bucket
-    for key in domain_length_buckets:
-        random.shuffle(domain_length_buckets[key])
-
-    # Round-robin selection
     selected = []
     bucket_iters = {k: iter(v) for k, v in domain_length_buckets.items()}
     keys = list(bucket_iters.keys())
 
-    while len(selected) < n and bucket_iters:
+    while len(selected) < n and keys:
         for key in list(keys):
             if len(selected) >= n:
                 break
@@ -387,220 +237,114 @@ def load_longbench_dataset(
             except StopIteration:
                 keys.remove(key)
 
-    # Shuffle final selection for randomness
     random.shuffle(selected)
-
     logger.info(f"Selected {len(selected)} examples")
-    return selected
+    return selected, eligible_pool_size
 
 
 # =============================================================================
-# Prompt Building
-# =============================================================================
-
-def build_prompt(example: Dict, context: str) -> str:
-    """Build the multiple-choice prompt."""
-    question = example.get('question', '')
-    choice_a = example.get('choice_A', '')
-    choice_b = example.get('choice_B', '')
-    choice_c = example.get('choice_C', '')
-    choice_d = example.get('choice_D', '')
-
-    prompt = f"""Read the following context and answer the multiple-choice question.
-
-Context:
-{context}
-
-Question: {question}
-
-A) {choice_a}
-B) {choice_b}
-C) {choice_c}
-D) {choice_d}
-
-Answer with ONLY the letter (A, B, C, or D) of the correct answer."""
-
-    return prompt
-
-
-# =============================================================================
-# Cost Estimation
+# Budget Estimation
 # =============================================================================
 
 def estimate_cost(
     examples: List[Dict],
-    conditions: List[Tuple[str, float, Callable]],
-    config: EvalConfig
+    conditions: List[Tuple[str, float, Optional[Callable]]],
+    compressor_fn: Optional[Callable],
+    max_output_tokens: int,
+    max_retries: int,
+    price_in: float,
+    price_out: float,
+    compressor_mode: str = "ml",
+    compressor_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Estimate total cost for all conditions.
+    Estimate maximum possible cost including retries.
 
-    Returns (total_cost, per_condition_costs)
+    Returns:
+        Tuple of (total_estimated, per_condition_costs)
     """
-    per_condition = {}
+    compressor_kwargs = compressor_kwargs or {}
+    per_cond = {}
     total = 0.0
 
-    for cond_name, cutoff, compressor_fn in conditions:
+    for cond_name, cutoff, _ in conditions:
         cond_cost = 0.0
 
         for example in examples:
             context = example.get('context', '')
-            prompt = build_prompt(example, context)
+            prompt = build_prompt_from_example(example, context)
 
-            # Apply compression
-            if compressor_fn:
-                compressed, _ = compressor_fn(prompt, cutoff)
+            # Apply compression for non-baseline (use same path as runtime)
+            if cutoff > 0 and compressor_fn:
+                query_text = example.get("question", "") or example.get("input", "") or ""
+                compressed, _ = compressor_fn(
+                    prompt, 
+                    cutoff, 
+                    mode=compressor_mode,
+                    query_text=query_text,
+                    **compressor_kwargs,
+                )
                 input_tokens = count_tokens(compressed)
             else:
                 input_tokens = count_tokens(prompt)
 
-            # Cost calculation
-            input_cost = (input_tokens / 1_000_000) * config.price_input_per_million
-            output_cost = (config.max_output_tokens / 1_000_000) * config.price_output_per_million
+            # Cost per request (with retry upper bound)
+            requests_per_example = 1 + max_retries
+            input_cost = (input_tokens / 1_000_000) * price_in * requests_per_example
+            output_cost = (max_output_tokens / 1_000_000) * price_out * requests_per_example
             cond_cost += input_cost + output_cost
 
-        per_condition[cond_name] = cond_cost
+        per_cond[cond_name] = cond_cost
         total += cond_cost
 
-    return total, per_condition
+    return total, per_cond
 
 
-def adjust_sample_size(
+def adjust_sample_size_for_budget(
     examples: List[Dict],
-    conditions: List[Tuple[str, float, Callable]],
-    config: EvalConfig
+    conditions: List[Tuple[str, float, Optional[Callable]]],
+    compressor_fn: Optional[Callable],
+    max_output_tokens: int,
+    max_retries: int,
+    price_in: float,
+    price_out: float,
+    budget_usd: float,
+    compressor_mode: str = "ml",
+    compressor_kwargs: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Adjust sample size to fit within budget."""
+    """Find largest N that fits within budget."""
     n = len(examples)
-
     while n > 1:
         subset = examples[:n]
-        estimated, _ = estimate_cost(subset, conditions, config)
-
-        if estimated <= config.budget_usd:
+        estimated, _ = estimate_cost(
+            subset, conditions, compressor_fn,
+            max_output_tokens, max_retries, price_in, price_out,
+            compressor_mode, compressor_kwargs
+        )
+        if estimated <= budget_usd:
             return n
-
         n = max(1, n - 5)
-
     return n
 
 
 # =============================================================================
-# Bootstrap Statistics
+# Identity Compressor
 # =============================================================================
 
-def bootstrap_ci(
-    data: List[float],
-    n_iterations: int = 10_000,
-    ci: float = 0.95,
-    seed: int = 42
-) -> Tuple[float, float, float]:
-    """
-    Compute bootstrap confidence interval.
-
-    Returns (mean, ci_lower, ci_upper)
-    """
-    if not data:
-        return 0.0, 0.0, 0.0
-
-    if NUMPY_AVAILABLE:
-        np.random.seed(seed)
-        data_arr = np.array(data)
-        means = []
-        for _ in range(n_iterations):
-            sample = np.random.choice(data_arr, size=len(data_arr), replace=True)
-            means.append(np.mean(sample))
-        means = np.array(means)
-        alpha = (1 - ci) / 2
-        return float(np.mean(data)), float(np.percentile(means, alpha * 100)), float(np.percentile(means, (1 - alpha) * 100))
-    else:
-        random.seed(seed)
-        means = []
-        for _ in range(n_iterations):
-            sample = random.choices(data, k=len(data))
-            means.append(sum(sample) / len(sample))
-        means.sort()
-        alpha = (1 - ci) / 2
-        lower_idx = int(alpha * len(means))
-        upper_idx = int((1 - alpha) * len(means))
-        return sum(data) / len(data), means[lower_idx], means[upper_idx]
-
-
-def bootstrap_diff(
-    baseline: List[float],
-    treatment: List[float],
-    n_iterations: int = 10_000,
-    seed: int = 42
-) -> Tuple[float, float, float, float]:
-    """
-    Bootstrap difference between treatment and baseline.
-
-    Returns (mean_diff, ci_lower, ci_upper, p_better)
-    """
-    if not baseline or not treatment:
-        return 0.0, 0.0, 0.0, 0.0
-
-    if NUMPY_AVAILABLE:
-        np.random.seed(seed)
-        base_arr = np.array(baseline)
-        treat_arr = np.array(treatment)
-        diffs = []
-        for _ in range(n_iterations):
-            base_sample = np.random.choice(base_arr, size=len(base_arr), replace=True)
-            treat_sample = np.random.choice(treat_arr, size=len(treat_arr), replace=True)
-            diffs.append(np.mean(treat_sample) - np.mean(base_sample))
-        diffs = np.array(diffs)
-        p_better = float(np.mean(diffs > 0))
-        return float(np.mean(diffs)), float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5)), p_better
-    else:
-        random.seed(seed)
-        diffs = []
-        for _ in range(n_iterations):
-            base_sample = random.choices(baseline, k=len(baseline))
-            treat_sample = random.choices(treatment, k=len(treatment))
-            diff = sum(treat_sample) / len(treat_sample) - sum(base_sample) / len(base_sample)
-            diffs.append(diff)
-        diffs.sort()
-        p_better = sum(1 for d in diffs if d > 0) / len(diffs)
-        return sum(diffs) / len(diffs), diffs[int(0.025 * len(diffs))], diffs[int(0.975 * len(diffs))], p_better
+def identity_compressor(prompt: str, importance_cutoff: float = 0.0, **kwargs) -> Tuple[str, dict]:
+    """Identity compressor for baseline - returns input unchanged."""
+    tokens = count_tokens(prompt)
+    return prompt, {
+        'original_tokens': tokens,
+        'compressed_tokens': tokens,
+        'reduction_ratio': 0.0,
+        'method': 'identity',
+    }
 
 
 # =============================================================================
 # Main Evaluation
 # =============================================================================
-
-@dataclass
-class ExampleResult:
-    """Result for a single example."""
-    example_id: str
-    condition: str
-    cutoff: float
-    predicted: Optional[str]
-    correct: str
-    is_correct: bool
-    is_valid: bool
-    input_tokens: int
-    output_tokens: int
-    cost: float
-    cached: bool = False
-
-
-@dataclass
-class ConditionResult:
-    """Aggregated results for a condition."""
-    condition: str
-    cutoff: float
-    accuracy: float
-    invalid_rate: float
-    mean_input_tokens: float
-    token_reduction_vs_baseline: float
-    total_cost: float
-    n_examples: int
-    delta_vs_baseline: float = 0.0
-    delta_ci_lower: float = 0.0
-    delta_ci_upper: float = 0.0
-    p_better: float = 0.0
-
 
 def run_experiment(
     compressor_fn: Callable[[str, float], Tuple[str, dict]],
@@ -612,95 +356,103 @@ def run_experiment(
     max_context_tokens_for_sampling: int = 60_000,
     max_output_tokens: int = 8,
     temperature: float = 0.0,
-    price_input_per_million: float = 0.15,
-    price_output_per_million: float = 0.60,
+    price_in: float = 0.15,
+    price_out: float = 0.60,
+    retry_invalid: int = 1,
     cache_dir: str = "runs/cache",
     results_dir: str = "runs",
-    no_api: bool = False,
+    dry_run: bool = False,
     openrouter_api_key: Optional[str] = None,
+    write_artifacts: bool = True,
+    compressor_mode: str = "ml",
+    compressor_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Run the LongBench v2 evaluation experiment.
+    Run LongBench v2 evaluation experiment.
 
     Args:
-        compressor_fn: Function (prompt, cutoff) -> (compressed, stats)
+        compressor_fn: Compression function (prompt, cutoff) -> (compressed, stats)
         cutoffs: List of cutoff values for compression conditions
         model: OpenRouter model ID
         n: Number of examples to sample
         seed: Random seed
         budget_usd: Maximum budget in USD
-        max_context_tokens_for_sampling: Filter contexts to this token limit
+        max_context_tokens_for_sampling: Filter contexts to this limit
         max_output_tokens: Max tokens for model output
-        temperature: Model temperature
-        price_input_per_million: Input token price per million
-        price_output_per_million: Output token price per million
-        cache_dir: Directory for caching results
-        results_dir: Directory for saving results
-        no_api: If True, run in dry-run mode without API calls
+        temperature: Model temperature (use 0 for determinism)
+        price_in: Price per million input tokens
+        price_out: Price per million output tokens
+        retry_invalid: Max retries for invalid responses
+        cache_dir: Cache directory
+        results_dir: Results directory
+        dry_run: If True, no API calls
+        openrouter_api_key: API key (or from env)
+        write_artifacts: If True, write debug artifacts
+        compressor_mode: Compression mode (ml, hybrid, heuristic, identity)
+        compressor_kwargs: Additional kwargs for compressor
 
     Returns:
-        Dictionary with results and statistics
+        Results dictionary
     """
-    config = EvalConfig(
-        model=model,
-        n=n,
-        seed=seed,
-        cutoffs=cutoffs,
-        budget_usd=budget_usd,
-        max_context_tokens_for_sampling=max_context_tokens_for_sampling,
-        max_output_tokens=max_output_tokens,
-        temperature=temperature,
-        price_input_per_million=price_input_per_million,
-        price_output_per_million=price_output_per_million,
-        cache_dir=cache_dir,
-        results_dir=results_dir,
-        no_api=no_api,
-        openrouter_api_key=openrouter_api_key or os.getenv("OPENROUTER_API_KEY"),
-    )
+    compressor_kwargs = compressor_kwargs or {}
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
 
-    # Setup cache
-    cache = ResultCache(config.cache_dir)
-    Path(config.results_dir).mkdir(parents=True, exist_ok=True)
+    # Setup directories
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    cache = ResultCache(cache_dir)
+    artifact_writer = ArtifactWriter(results_dir, run_id) if write_artifacts else None
 
-    # Define conditions
-    from compressor import identity_compressor
-    conditions = [("baseline", 0.0, identity_compressor)]
+    # Define conditions: baseline + compressed
+    conditions: List[Tuple[str, float, Optional[Callable]]] = [
+        ("baseline", 0.0, None),
+    ]
     for cutoff in cutoffs:
         conditions.append((f"cutoff={cutoff}", cutoff, compressor_fn))
 
     # Load dataset
-    examples = load_longbench_dataset(
-        max_context_tokens=config.max_context_tokens_for_sampling,
-        n=config.n,
-        seed=config.seed
+    examples, eligible_pool_size = load_longbench_dataset(
+        max_context_tokens=max_context_tokens_for_sampling,
+        n=n,
+        seed=seed,
     )
 
     if not examples:
-        logger.error("No examples loaded!")
         return {"error": "No examples loaded"}
 
-    # Estimate cost and adjust sample size
-    estimated_cost, per_cond_cost = estimate_cost(examples, conditions, config)
-    logger.info(f"Estimated cost for {len(examples)} examples: ${estimated_cost:.4f}")
+    # Estimate cost and adjust N if needed
+    estimated_cost, per_cond_cost = estimate_cost(
+        examples, conditions, compressor_fn,
+        max_output_tokens, retry_invalid, price_in, price_out,
+        compressor_mode, compressor_kwargs
+    )
+    logger.info(f"Estimated max cost for {len(examples)} examples: ${estimated_cost:.4f}")
 
-    if estimated_cost > config.budget_usd:
-        new_n = adjust_sample_size(examples, conditions, config)
-        logger.warning(f"Budget exceeded! Reducing sample size from {len(examples)} to {new_n}")
+    if estimated_cost > budget_usd:
+        new_n = adjust_sample_size_for_budget(
+            examples, conditions, compressor_fn,
+            max_output_tokens, retry_invalid, price_in, price_out, budget_usd,
+            compressor_mode, compressor_kwargs
+        )
+        logger.warning(f"Budget exceeded. Reducing N from {len(examples)} to {new_n}")
         examples = examples[:new_n]
-        estimated_cost, per_cond_cost = estimate_cost(examples, conditions, config)
+        estimated_cost, per_cond_cost = estimate_cost(
+            examples, conditions, compressor_fn,
+            max_output_tokens, retry_invalid, price_in, price_out,
+            compressor_mode, compressor_kwargs
+        )
         logger.info(f"New estimated cost: ${estimated_cost:.4f}")
 
-    if not examples:
-        logger.error("Cannot run experiment with 0 examples")
-        return {"error": "Budget too low for any samples"}
+    final_n = len(examples)
+    logger.info(f"Final sample size: {final_n}")
 
-    # Setup API client
+    # Setup client
     client = None
-    if not config.no_api and config.openrouter_api_key:
-        client = OpenRouterClient(config.openrouter_api_key)
-    elif not config.no_api:
-        logger.warning("No API key found, running in dry-run mode")
-        config.no_api = True
+    if not dry_run and api_key:
+        client = OpenRouterClient(api_key)
+    elif not dry_run:
+        logger.warning("No API key, switching to dry-run mode")
+        dry_run = True
 
     # Run evaluation
     all_results: List[ExampleResult] = []
@@ -708,259 +460,372 @@ def run_experiment(
 
     for cond_name, cutoff, cond_compressor in conditions:
         logger.info(f"Running condition: {cond_name}")
+        is_baseline = (cond_name == "baseline")
 
         for i, example in enumerate(examples):
             example_id = example.get('_id', str(i))
             context = example.get('context', '')
-            correct_answer = example.get('answer', '').upper()
+            gold = example.get('answer', '').upper()
 
-            # Build and compress prompt
-            full_prompt = build_prompt(example, context)
+            # Build baseline prompt
+            baseline_prompt = build_prompt_from_example(example, context)
 
-            if cond_compressor:
-                compressed_prompt, comp_stats = cond_compressor(full_prompt, cutoff)
+            # Extract query_text for relevance scoring
+            query_text = (
+                example.get("question", "") or 
+                example.get("input", "") or 
+                example.get("task", "") or
+                ""
+            )
+            # If no explicit query, use the last 500 chars of the prompt as query hint
+            if not query_text:
+                query_text = baseline_prompt.strip()[-500:]
+            
+            # Apply compression if not baseline
+            if is_baseline:
+                final_prompt = baseline_prompt
+                fallback_used = False
+                comp_stats = {'original_tokens': count_tokens(baseline_prompt), 'compressed_tokens': count_tokens(baseline_prompt)}
             else:
-                compressed_prompt = full_prompt
-                comp_stats = {'original_tokens': count_tokens(full_prompt), 'compressed_tokens': count_tokens(full_prompt)}
+                compressed, comp_stats = compressor_fn(
+                    baseline_prompt, 
+                    cutoff,
+                    mode=compressor_mode,
+                    query_text=query_text,
+                    use_embeddings=True,
+                    cache_dir="runs/emb_cache",
+                    **compressor_kwargs,
+                )
+                # Validate compressed prompt structure
+                valid, validation_details = validate_compressed_prompt(compressed, example)
+                if not valid:
+                    # Fail open to baseline
+                    logger.debug(f"Compression validation failed for {example_id}, using baseline")
+                    final_prompt = baseline_prompt
+                    fallback_used = True
+                else:
+                    # Ensure final instruction is present
+                    final_prompt = ensure_final_instruction(compressed)
+                    fallback_used = False
 
-            input_tokens = count_tokens(compressed_prompt)
-            prompt_hash = hashlib.sha256(compressed_prompt.encode()).hexdigest()[:16]
+            input_tokens = count_tokens(final_prompt)
+            prompt_hash = compute_prompt_hash(final_prompt)
+
+            # Write prompt artifact
+            if artifact_writer:
+                artifact_writer.write_prompt(example_id, cond_name, final_prompt, is_baseline=is_baseline)
+                if not is_baseline:
+                    artifact_writer.write_prompt(example_id, cond_name, baseline_prompt, is_baseline=True)
 
             # Check cache
-            cached_result = cache.get(
-                model=config.model,
+            cache_key = CacheKey(
+                model=model,
                 condition=cond_name,
                 cutoff=cutoff,
                 example_id=example_id,
-                temperature=config.temperature,
-                prompt_hash=prompt_hash
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                prompt_hash=prompt_hash,
+                retry_index=0,
             )
 
-            if cached_result:
+            cached = cache.get(cache_key)
+            if cached:
                 result = ExampleResult(
                     example_id=example_id,
                     condition=cond_name,
                     cutoff=cutoff,
-                    predicted=cached_result.get('predicted'),
-                    correct=correct_answer,
-                    is_correct=cached_result.get('is_correct', False),
-                    is_valid=cached_result.get('is_valid', False),
-                    input_tokens=cached_result.get('input_tokens', input_tokens),
-                    output_tokens=cached_result.get('output_tokens', config.max_output_tokens),
-                    cost=cached_result.get('cost', 0.0),
-                    cached=True
+                    predicted=cached.get('predicted'),
+                    gold=gold,
+                    is_correct=cached.get('is_correct', False),
+                    is_valid=cached.get('is_valid', False),
+                    input_tokens=cached.get('input_tokens', input_tokens),
+                    output_tokens=cached.get('output_tokens', 0),
+                    total_tokens=cached.get('input_tokens', input_tokens) + cached.get('output_tokens', 0),
+                    cost_usd=cached.get('cost_usd', 0.0),
+                    cached=True,
+                    retry_count=cached.get('retry_count', 0),
+                    invalid_before_retry=cached.get('invalid_before_retry', False),
+                    invalid_after_retry=cached.get('invalid_after_retry', not cached.get('is_valid', False)),
+                    fallback_used=cached.get('fallback_used', fallback_used),
+                    raw_response=cached.get('raw_response', ''),
                 )
-            elif config.no_api:
-                # Dry run - simulate response
+                all_results.append(result)
+                cumulative_cost += result.cost_usd
+                continue
+
+            if dry_run:
+                # Simulate
                 result = ExampleResult(
                     example_id=example_id,
                     condition=cond_name,
                     cutoff=cutoff,
                     predicted=None,
-                    correct=correct_answer,
+                    gold=gold,
                     is_correct=False,
                     is_valid=False,
                     input_tokens=input_tokens,
-                    output_tokens=config.max_output_tokens,
-                    cost=0.0,
-                    cached=False
+                    output_tokens=0,
+                    total_tokens=input_tokens,
+                    cost_usd=0.0,
+                    cached=False,
+                    retry_count=0,
+                    invalid_before_retry=True,
+                    invalid_after_retry=True,
+                    fallback_used=fallback_used,
+                    raw_response="",
                 )
-            else:
-                # Make API call
-                messages = [{"role": "user", "content": compressed_prompt}]
+                all_results.append(result)
+                continue
 
+            # Make API call(s)
+            messages = [{"role": "user", "content": final_prompt}]
+            raw_response = ""
+            predicted = None
+            is_valid = False
+            output_tokens = 0
+            retry_count = 0
+            invalid_before_retry = False
+
+            for attempt in range(1 + retry_invalid):
                 try:
                     response = client.chat_completion(
                         messages=messages,
-                        model=config.model,
-                        temperature=config.temperature,
-                        max_tokens=config.max_output_tokens
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_output_tokens,
                     )
 
-                    # Extract response
-                    output_text = response.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    raw_response = response.get('choices', [{}])[0].get('message', {}).get('content', '')
                     usage = response.get('usage', {})
-                    output_tokens = usage.get('completion_tokens', config.max_output_tokens)
+                    output_tokens = usage.get('completion_tokens', max_output_tokens)
 
-                    # Parse answer
-                    predicted = parse_answer(output_text)
+                    predicted = parse_answer(raw_response)
                     is_valid = predicted is not None
-                    is_correct = is_valid and predicted == correct_answer
 
-                    # Calculate cost
-                    cost = (
-                        (input_tokens / 1_000_000) * config.price_input_per_million +
-                        (output_tokens / 1_000_000) * config.price_output_per_million
-                    )
+                    if artifact_writer:
+                        artifact_writer.write_response(example_id, cond_name, raw_response, retry_index=attempt)
 
-                    result = ExampleResult(
-                        example_id=example_id,
-                        condition=cond_name,
-                        cutoff=cutoff,
-                        predicted=predicted,
-                        correct=correct_answer,
-                        is_correct=is_correct,
-                        is_valid=is_valid,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost=cost,
-                        cached=False
-                    )
+                    if is_valid:
+                        break
 
-                    # Cache the result
-                    cache.set(
-                        model=config.model,
-                        condition=cond_name,
-                        cutoff=cutoff,
-                        example_id=example_id,
-                        temperature=config.temperature,
-                        prompt_hash=prompt_hash,
-                        result={
-                            'predicted': predicted,
-                            'is_correct': is_correct,
-                            'is_valid': is_valid,
-                            'input_tokens': input_tokens,
-                            'output_tokens': output_tokens,
-                            'cost': cost,
-                        }
-                    )
+                    # Mark first attempt invalid
+                    if attempt == 0:
+                        invalid_before_retry = True
+
+                    # Retry with repair prompt
+                    if attempt < retry_invalid:
+                        retry_count += 1
+                        repair = build_repair_prompt(raw_response)
+                        messages.append({"role": "assistant", "content": raw_response})
+                        messages.append({"role": "user", "content": repair})
 
                 except Exception as e:
-                    logger.error(f"API error for example {example_id}: {e}")
-                    result = ExampleResult(
-                        example_id=example_id,
-                        condition=cond_name,
-                        cutoff=cutoff,
-                        predicted=None,
-                        correct=correct_answer,
-                        is_correct=False,
-                        is_valid=False,
-                        input_tokens=input_tokens,
-                        output_tokens=0,
-                        cost=0.0,
-                        cached=False
-                    )
+                    logger.error(f"API error for {example_id}: {e}")
+                    break
+
+            is_correct = is_valid and predicted == gold
+            cost = (
+                (input_tokens / 1_000_000) * price_in +
+                (output_tokens / 1_000_000) * price_out
+            )
+
+            result = ExampleResult(
+                example_id=example_id,
+                condition=cond_name,
+                cutoff=cutoff,
+                predicted=predicted,
+                gold=gold,
+                is_correct=is_correct,
+                is_valid=is_valid,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                cost_usd=cost,
+                cached=False,
+                retry_count=retry_count,
+                invalid_before_retry=invalid_before_retry,
+                invalid_after_retry=not is_valid,
+                fallback_used=fallback_used,
+                raw_response=raw_response,
+            )
+
+            # Cache result
+            cache.set(cache_key, {
+                'predicted': predicted,
+                'is_correct': is_correct,
+                'is_valid': is_valid,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'cost_usd': cost,
+                'retry_count': retry_count,
+                'invalid_before_retry': invalid_before_retry,
+                'fallback_used': fallback_used,
+                'raw_response': raw_response,
+            })
+
+            # Write parsed answer artifact
+            if artifact_writer:
+                artifact_writer.write_parsed_answer(example_id, cond_name, {
+                    'valid': is_valid,
+                    'predicted': predicted,
+                    'gold': gold,
+                    'correct': is_correct,
+                    'retry_count': retry_count,
+                    'fallback_used': fallback_used,
+                })
 
             all_results.append(result)
-            cumulative_cost += result.cost
+            cumulative_cost += cost
 
-            # Progress logging
             if (i + 1) % 5 == 0:
-                logger.info(f"  [{cond_name}] {i+1}/{len(examples)} | Cumulative cost: ${cumulative_cost:.4f}")
+                logger.info(f"  [{cond_name}] {i+1}/{final_n} | Cost so far: ${cumulative_cost:.4f}")
 
-    # Aggregate results
-    condition_results = aggregate_results(all_results, config)
+    # Aggregate metrics
+    condition_metrics = aggregate_metrics(all_results, conditions, seed)
 
-    # Print results table
-    print_results_table(condition_results)
+    # Print table
+    print_results_table(condition_metrics)
+
+    # Build config dict
+    config = {
+        'model': model,
+        'n': final_n,
+        'seed': seed,
+        'cutoffs': cutoffs,
+        'budget_usd': budget_usd,
+        'max_context_tokens_for_sampling': max_context_tokens_for_sampling,
+        'max_output_tokens': max_output_tokens,
+        'temperature': temperature,
+        'price_in': price_in,
+        'price_out': price_out,
+        'retry_invalid': retry_invalid,
+        'dry_run': dry_run,
+        'compressor_mode': compressor_mode,
+    }
+
+    run_metadata = {
+        'run_id': run_id,
+        'timestamp': datetime.now().isoformat(),
+        'eligible_pool_size': eligible_pool_size,
+        'final_sample_size': final_n,
+        'total_cost_usd': cumulative_cost,
+        'cache_stats': cache.get_stats(),
+    }
 
     # Save results
-    results_data = {
-        'config': asdict(config),
-        'conditions': [asdict(r) for r in condition_results],
-        'examples': [asdict(r) for r in all_results],
+    save_results_json(results_dir, config, condition_metrics, all_results, run_metadata)
+    save_results_csv(results_dir, condition_metrics)
+    save_examples_csv(results_dir, all_results)
+
+    logger.info(f"Results saved to {results_dir}/")
+    logger.info(f"Total cost: ${cumulative_cost:.4f}")
+
+    return {
+        'config': config,
+        'run_metadata': run_metadata,
+        'conditions': [asdict(m) for m in condition_metrics],
         'total_cost': cumulative_cost,
     }
 
-    results_json = Path(config.results_dir) / "results.json"
-    with open(results_json, 'w') as f:
-        json.dump(results_data, f, indent=2)
-    logger.info(f"Results saved to {results_json}")
 
-    # Save CSV
-    results_csv = Path(config.results_dir) / "results.csv"
-    save_results_csv(condition_results, results_csv)
-    logger.info(f"CSV saved to {results_csv}")
-
-    return results_data
-
-
-def aggregate_results(
+def aggregate_metrics(
     results: List[ExampleResult],
-    config: EvalConfig
-) -> List[ConditionResult]:
-    """Aggregate individual results into condition-level statistics."""
-    # Group by condition
-    by_condition = defaultdict(list)
+    conditions: List[Tuple[str, float, Optional[Callable]]],
+    seed: int,
+) -> List[ConditionMetrics]:
+    """Aggregate per-example results into condition-level metrics."""
+    by_cond: Dict[str, List[ExampleResult]] = defaultdict(list)
     for r in results:
-        by_condition[r.condition].append(r)
+        by_cond[r.condition].append(r)
 
-    # Get baseline results for comparison
-    baseline_results = by_condition.get('baseline', [])
-    baseline_correct = [1.0 if r.is_correct else 0.0 for r in baseline_results if r.is_valid]
-    baseline_tokens = [r.input_tokens for r in baseline_results]
-    baseline_mean_tokens = sum(baseline_tokens) / len(baseline_tokens) if baseline_tokens else 0
+    # Get baseline data for comparison
+    baseline_results = by_cond.get('baseline', [])
+    baseline_correct = [r.is_correct for r in baseline_results]
+    baseline_valid = [r.is_valid for r in baseline_results]
+    baseline_input_tokens = [r.input_tokens for r in baseline_results]
+    baseline_mean_tokens = sum(baseline_input_tokens) / len(baseline_input_tokens) if baseline_input_tokens else 1
 
-    condition_results = []
+    # Build example_id -> baseline result mapping for pairing
+    baseline_by_id = {r.example_id: r for r in baseline_results}
 
-    for cond_name, cond_results in by_condition.items():
-        valid_results = [r for r in cond_results if r.is_valid]
-        correct_list = [1.0 if r.is_correct else 0.0 for r in cond_results if r.is_valid]
+    metrics_list = []
 
-        accuracy = sum(correct_list) / len(correct_list) if correct_list else 0.0
-        invalid_rate = 1.0 - (len(valid_results) / len(cond_results)) if cond_results else 0.0
-        mean_tokens = sum(r.input_tokens for r in cond_results) / len(cond_results) if cond_results else 0
-        token_reduction = 1.0 - (mean_tokens / baseline_mean_tokens) if baseline_mean_tokens > 0 else 0.0
-        total_cost = sum(r.cost for r in cond_results)
-        cutoff = cond_results[0].cutoff if cond_results else 0.0
+    for cond_name, cutoff, _ in conditions:
+        cond_results = by_cond.get(cond_name, [])
+        if not cond_results:
+            continue
 
-        # Bootstrap comparison to baseline
-        if cond_name != 'baseline' and baseline_correct and correct_list:
-            delta, ci_lower, ci_upper, p_better = bootstrap_diff(
-                baseline_correct, correct_list, seed=config.seed
+        n_examples = len(cond_results)
+        correct = [r.is_correct for r in cond_results]
+        valid = [r.is_valid for r in cond_results]
+
+        acc_strict = compute_accuracy_strict(correct, valid)
+        acc_valid_only = compute_accuracy_valid_only(correct, valid)
+        invalid_rate = compute_invalid_rate(valid)
+
+        invalid_before = sum(1 for r in cond_results if r.invalid_before_retry)
+        invalid_after = sum(1 for r in cond_results if r.invalid_after_retry)
+        fallbacks = sum(1 for r in cond_results if r.fallback_used)
+
+        mean_in = sum(r.input_tokens for r in cond_results) / n_examples
+        mean_out = sum(r.output_tokens for r in cond_results) / n_examples
+        mean_total = sum(r.total_tokens for r in cond_results) / n_examples
+        token_reduction = 1.0 - (mean_in / baseline_mean_tokens) if baseline_mean_tokens > 0 else 0.0
+
+        actual_cost = sum(r.cost_usd for r in cond_results)
+        estimated_cost = actual_cost  # Already actual for completed runs
+
+        # Statistical comparison to baseline
+        if cond_name != "baseline" and baseline_results:
+            # Pair by example_id
+            paired_baseline_correct = []
+            paired_treatment_correct = []
+            for r in cond_results:
+                if r.example_id in baseline_by_id:
+                    br = baseline_by_id[r.example_id]
+                    # Strict: invalid = wrong
+                    paired_baseline_correct.append(br.is_correct and br.is_valid)
+                    paired_treatment_correct.append(r.is_correct and r.is_valid)
+
+            # Bootstrap paired difference
+            baseline_strict = [1.0 if c else 0.0 for c in paired_baseline_correct]
+            treatment_strict = [1.0 if c else 0.0 for c in paired_treatment_correct]
+            delta, ci_lo, ci_hi, p_better = bootstrap_paired_diff(
+                baseline_strict, treatment_strict, seed=seed
             )
-        else:
-            delta, ci_lower, ci_upper, p_better = 0.0, 0.0, 0.0, 0.5
 
-        condition_results.append(ConditionResult(
+            # McNemar test
+            chi2, pval, _, _ = mcnemar_test(paired_baseline_correct, paired_treatment_correct)
+        else:
+            delta, ci_lo, ci_hi, p_better = 0.0, 0.0, 0.0, 0.5
+            chi2, pval = 0.0, 1.0
+
+        metrics_list.append(ConditionMetrics(
             condition=cond_name,
             cutoff=cutoff,
-            accuracy=accuracy,
+            n_examples=n_examples,
+            accuracy_strict=acc_strict,
+            accuracy_valid_only=acc_valid_only,
             invalid_rate=invalid_rate,
-            mean_input_tokens=mean_tokens,
+            invalid_before_retry_rate=invalid_before / n_examples if n_examples else 0,
+            invalid_after_retry_rate=invalid_after / n_examples if n_examples else 0,
+            fallback_rate=fallbacks / n_examples if n_examples else 0,
+            mean_input_tokens=mean_in,
+            mean_output_tokens=mean_out,
+            mean_total_tokens=mean_total,
             token_reduction_vs_baseline=token_reduction,
-            total_cost=total_cost,
-            n_examples=len(cond_results),
-            delta_vs_baseline=delta,
-            delta_ci_lower=ci_lower,
-            delta_ci_upper=ci_upper,
+            estimated_cost_usd=estimated_cost,
+            actual_cost_usd=actual_cost,
+            delta_strict_vs_baseline=delta,
+            delta_ci_lower=ci_lo,
+            delta_ci_upper=ci_hi,
             p_better=p_better,
+            mcnemar_chi2=chi2,
+            mcnemar_pvalue=pval,
         ))
 
-    return condition_results
-
-
-def print_results_table(results: List[ConditionResult]):
-    """Print formatted results table."""
-    print("\n" + "=" * 100)
-    print("RESULTS")
-    print("=" * 100)
-    print(f"{'Condition':<15} | {'Accuracy':>8} | {'Δ vs Base':>10} | {'95% CI':>15} | {'Token Red.':>10} | {'Invalid':>8} | {'Cost':>8}")
-    print("-" * 100)
-
-    for r in results:
-        ci_str = f"[{r.delta_ci_lower:+.3f}, {r.delta_ci_upper:+.3f}]" if r.condition != 'baseline' else "---"
-        delta_str = f"{r.delta_vs_baseline:+.3f}" if r.condition != 'baseline' else "---"
-        print(f"{r.condition:<15} | {r.accuracy:>8.3f} | {delta_str:>10} | {ci_str:>15} | {r.token_reduction_vs_baseline:>9.1%} | {r.invalid_rate:>7.1%} | ${r.total_cost:>7.4f}")
-
-    print("=" * 100)
-
-
-def save_results_csv(results: List[ConditionResult], path: Path):
-    """Save results as CSV."""
-    headers = ['condition', 'cutoff', 'accuracy', 'delta_vs_baseline', 'ci_lower', 'ci_upper',
-               'p_better', 'token_reduction', 'invalid_rate', 'cost', 'n_examples']
-
-    with open(path, 'w') as f:
-        f.write(','.join(headers) + '\n')
-        for r in results:
-            row = [
-                r.condition, str(r.cutoff), f"{r.accuracy:.4f}", f"{r.delta_vs_baseline:.4f}",
-                f"{r.delta_ci_lower:.4f}", f"{r.delta_ci_upper:.4f}", f"{r.p_better:.4f}",
-                f"{r.token_reduction_vs_baseline:.4f}", f"{r.invalid_rate:.4f}",
-                f"{r.total_cost:.6f}", str(r.n_examples)
-            ]
-            f.write(','.join(row) + '\n')
+    return metrics_list
 
 
 # =============================================================================
@@ -970,7 +835,7 @@ def save_results_csv(results: List[ConditionResult], path: Path):
 def main():
     parser = argparse.ArgumentParser(
         description="LongBench v2 Evaluation for prompt compression",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument('--model', type=str, default='openai/gpt-4o-mini',
@@ -978,36 +843,46 @@ def main():
     parser.add_argument('--n', type=int, default=30,
                         help='Number of examples to sample')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility')
+                        help='Random seed')
     parser.add_argument('--cutoffs', type=float, nargs='+', default=[0.3, 0.9],
                         help='Compression cutoff values')
     parser.add_argument('--budget-usd', type=float, default=10.0,
                         help='Maximum budget in USD')
     parser.add_argument('--max-context-tokens-for-sampling', type=int, default=60000,
-                        help='Maximum context tokens for filtering examples')
+                        help='Max context tokens for filtering')
     parser.add_argument('--max-output-tokens', type=int, default=8,
-                        help='Maximum output tokens from model')
-    parser.add_argument('--price-input-per-million', type=float, default=0.15,
+                        help='Max output tokens')
+    parser.add_argument('--price-in', type=float, default=0.15,
                         help='Price per million input tokens')
-    parser.add_argument('--price-output-per-million', type=float, default=0.60,
+    parser.add_argument('--price-out', type=float, default=0.60,
                         help='Price per million output tokens')
+    parser.add_argument('--retry-invalid', type=int, default=1,
+                        help='Max retries for invalid responses')
     parser.add_argument('--cache-dir', type=str, default='runs/cache',
-                        help='Directory for caching API results')
+                        help='Cache directory')
     parser.add_argument('--results-dir', type=str, default='runs',
-                        help='Directory for saving results')
-    parser.add_argument('--no-api', action='store_true',
-                        help='Run in dry-run mode without API calls')
+                        help='Results directory')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Run without API calls')
+    parser.add_argument('--no-artifacts', action='store_true',
+                        help='Skip writing debug artifacts')
+    parser.add_argument('--compressor-mode', type=str, default='auto',
+                        choices=['auto', 'ml', 'hybrid', 'identity'],
+                        help='Compression mode: auto (ML-first with hybrid fallback), ml (LLMLingua-2), hybrid (IR+embeddings), identity (no compression)')
 
     args = parser.parse_args()
 
     # Import compressor
     try:
-        from compressor import compress_text
+        from .compressor import compress_text
     except ImportError:
-        logger.error("Could not import compressor.py. Make sure it exists in the same directory.")
-        sys.exit(1)
+        try:
+            from compressor import compress_text
+        except ImportError:
+            logger.error("Could not import compressor. Using identity.")
+            compress_text = identity_compressor
 
-    # Run experiment
+    # Run
     try:
         results = run_experiment(
             compressor_fn=compress_text,
@@ -1018,11 +893,14 @@ def main():
             budget_usd=args.budget_usd,
             max_context_tokens_for_sampling=args.max_context_tokens_for_sampling,
             max_output_tokens=args.max_output_tokens,
-            price_input_per_million=args.price_input_per_million,
-            price_output_per_million=args.price_output_per_million,
+            price_in=args.price_in,
+            price_out=args.price_out,
+            retry_invalid=args.retry_invalid,
             cache_dir=args.cache_dir,
             results_dir=args.results_dir,
-            no_api=args.no_api,
+            dry_run=args.dry_run,
+            write_artifacts=not args.no_artifacts,
+            compressor_mode=args.compressor_mode,
         )
 
         if 'error' in results:

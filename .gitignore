@@ -1,4 +1,6 @@
 **/.env
 .claude
 **/.venv/
-evals/runs
+runs/
+evals/runs/
+.cache/
