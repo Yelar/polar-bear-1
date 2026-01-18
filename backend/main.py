@@ -143,7 +143,7 @@ async def compress_text(payload: CompressRequest) -> CompressResponse:
             _log_token_savings(original_tokens, compressed_tokens, provider)
         except Exception:
             pass
-        
+
         tokens_saved = max(0, original_tokens - compressed_tokens)
         reduction_ratio = tokens_saved / original_tokens if original_tokens > 0 else 0.0
 

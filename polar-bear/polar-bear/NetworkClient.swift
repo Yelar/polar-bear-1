@@ -31,7 +31,7 @@ struct NetworkClient {
     
     /// Threshold for auto-routing: prompts below this use TokenC, above use local
     static let autoRoutingThreshold = 500
-    
+
     init(
         backendUrl: String,
         aggressiveness: Double = 0.5,
@@ -75,7 +75,7 @@ struct NetworkClient {
     private var endpoint: URL {
         URL(string: backendUrl) ?? URL(string: "http://127.0.0.1:8000/compress")!
     }
-    
+
     /// Compress text and return full result with stats
     func compressText(_ input: String) async throws -> CompressionResult {
         // Resolve provider based on text length and settings
@@ -89,7 +89,7 @@ struct NetworkClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 60 // Longer timeout for LLMLingua
-        
+
         let body = CompressRequest(
             input: input,
             aggressiveness: aggressiveness,
@@ -97,7 +97,7 @@ struct NetworkClient {
             provider: resolved.provider
         )
         request.httpBody = try JSONEncoder().encode(body)
-        
+
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             print("[NetworkClient] Error: Invalid response")
@@ -109,7 +109,7 @@ struct NetworkClient {
             print("[NetworkClient] Error: HTTP \(httpResponse.statusCode) - \(payload.prefix(200))")
             throw NetworkError.httpStatus(httpResponse.statusCode, payload)
         }
-        
+
         let decoded = try JSONDecoder().decode(CompressResponse.self, from: data)
         
         // Use backend stats if available, otherwise estimate

@@ -20,49 +20,82 @@ struct SettingsView: View {
     @State private var selectedTab = 0
     
     var body: some View {
-        TabView(selection: $selectedTab) {
-            // Stats Tab
-            StatsTabView(
-                totalTokensSaved: totalTokensSaved,
-                totalCompressions: totalCompressions,
-                onReset: resetStats
-            )
-            .tabItem {
-                Label("Statistics", systemImage: "chart.bar.fill")
+        VStack(spacing: 0) {
+            // Custom Tab Bar
+            HStack(spacing: 0) {
+                TabButton(title: "Statistics", icon: "chart.bar.fill", isSelected: selectedTab == 0) {
+                    selectedTab = 0
+                }
+                TabButton(title: "Settings", icon: "gear", isSelected: selectedTab == 1) {
+                    selectedTab = 1
+                }
+                TabButton(title: "About", icon: "info.circle.fill", isSelected: selectedTab == 2) {
+                    selectedTab = 2
+                }
             }
-            .tag(0)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
             
-            // Provider Tab
-            ProviderTabView(
-                provider: $provider,
-                tokencApiKey: $tokencApiKey,
-                backendUrl: $backendUrl
-            )
-            .tabItem {
-                Label("Provider", systemImage: "server.rack")
-            }
-            .tag(1)
+            Divider()
+                .padding(.top, 8)
             
-            // Compression Tab
-            CompressionTabView(aggressiveness: $aggressiveness)
-            .tabItem {
-                Label("Compression", systemImage: "arrow.down.right.and.arrow.up.left")
+            // Tab Content
+            Group {
+                switch selectedTab {
+                case 0:
+                    StatsTabView(
+                        totalTokensSaved: totalTokensSaved,
+                        totalCompressions: totalCompressions,
+                        onReset: resetStats
+                    )
+                case 1:
+                    ProviderTabView(
+                        provider: $provider,
+                        tokencApiKey: $tokencApiKey,
+                        backendUrl: $backendUrl,
+                        aggressiveness: $aggressiveness
+                    )
+                case 2:
+                    AboutTabView()
+                default:
+                    EmptyView()
+                }
             }
-            .tag(2)
-            
-            // About Tab
-            AboutTabView()
-            .tabItem {
-                Label("About", systemImage: "info.circle.fill")
-            }
-            .tag(3)
         }
-        .frame(width: 480, height: 420)
+        .frame(width: 500, height: 520)
     }
     
     private func resetStats() {
         totalTokensSaved = 0
         totalCompressions = 0
+    }
+}
+
+// MARK: - Tab Button
+
+struct TabButton: View {
+    let title: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 18))
+                Text(title)
+                    .font(.caption)
+            }
+            .foregroundStyle(isSelected ? .blue : .secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.blue.opacity(0.1) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -82,7 +115,7 @@ struct StatsTabView: View {
         guard totalCompressions > 0 else { return 0 }
         return totalTokensSaved / totalCompressions
     }
-    
+
     var body: some View {
         VStack(spacing: 24) {
             // Header with polar bear icon
@@ -176,7 +209,7 @@ struct StatCard: View {
     let value: String
     let icon: String
     let color: Color
-    
+
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
@@ -210,11 +243,77 @@ struct ProviderTabView: View {
     @Binding var provider: String
     @Binding var tokencApiKey: String
     @Binding var backendUrl: String
+    @Binding var aggressiveness: Double
     
+    private var compressionLabel: String {
+        switch aggressiveness {
+        case 0..<0.3: return "Light"
+        case 0.3..<0.6: return "Medium"
+        case 0.6..<0.8: return "Strong"
+        default: return "Maximum"
+        }
+    }
+    
+    private var compressionColor: Color {
+        switch aggressiveness {
+        case 0..<0.3: return .green
+        case 0.3..<0.6: return .blue
+        case 0.6..<0.8: return .orange
+        default: return .red
+        }
+    }
+
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Compression Provider")
-                .font(.title3.bold())
+            // COMPRESSION SLIDER - Most important, at the top
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Label("Compression Level", systemImage: "slider.horizontal.3")
+                        .font(.title3.bold())
+                    
+                    Spacer()
+                    
+                    Text(compressionLabel)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(compressionColor)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(compressionColor.opacity(0.15)))
+                }
+                
+                VStack(spacing: 6) {
+                    Slider(value: $aggressiveness, in: 0...1, step: 0.05)
+                        .tint(compressionColor)
+                    
+                    HStack {
+                        Text("0%")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "%.0f%%", aggressiveness * 100))
+                            .font(.headline.bold())
+                            .foregroundStyle(compressionColor)
+                        Spacer()
+                        Text("100%")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(16)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(compressionColor.opacity(0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(compressionColor.opacity(0.3), lineWidth: 1)
+                        )
+                )
+            }
+            
+            Divider()
+            
+            Text("Provider")
             
             // Provider Selection
             VStack(spacing: 12) {
@@ -307,7 +406,7 @@ struct ProviderTabView: View {
                     
                     TextField("http://127.0.0.1:8000/compress", text: $backendUrl)
                         .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
+                    .autocorrectionDisabled()
                     
                     Text("Run: cd backend && uvicorn main:app --reload")
                         .font(.caption)
@@ -316,9 +415,9 @@ struct ProviderTabView: View {
                 }
             }
             
-            Spacer()
         }
         .padding(20)
+        }  // ScrollView
     }
 }
 
@@ -562,8 +661,8 @@ struct AboutTabView: View {
                         Label("TokenC", systemImage: "globe")
                             .font(.caption)
                     }
-                }
             }
+        }
             
             Spacer()
             

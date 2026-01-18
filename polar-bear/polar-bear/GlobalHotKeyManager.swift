@@ -110,8 +110,8 @@ final class GlobalHotKeyManager {
         if Thread.isMainThread {
             onTrigger?()
         } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onTrigger?()
+        DispatchQueue.main.async { [weak self] in
+            self?.onTrigger?()
             }
         }
     }

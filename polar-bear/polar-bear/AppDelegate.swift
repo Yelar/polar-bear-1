@@ -187,7 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Polar Bear Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 480, height: 520))
+        window.setContentSize(NSSize(width: 500, height: 560))
         window.center()
         window.isReleasedWhenClosed = false
         
